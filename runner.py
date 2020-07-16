@@ -203,6 +203,36 @@ class CommandOptions:
 
 
 
+class DateTimeHandler:
+    """Handles Date and Time related information"""
+
+    dateTimeFormat = '%y-%m-%d_%H:%M:%S'
+
+    def getNow(self):
+        return datetime.now()
+
+    def getNowFormattedString(self):
+        return datetime.now().strftime(self.dateTimeFormat)
+
+
+class SignalHandler:
+    """Helper to indicate any specified incoming signals"""
+
+    def __init__(self):
+        self.receivedSignal = False
+        catchSignals = [
+            signal.SIGINT,
+            signal.SIGQUIT,
+            signal.SIGTERM
+        ]
+        for signum in catchSignals:
+            signal.signal(signum, self.handler)
+
+    def handler(self, signum, frame):
+        self.signal = signum
+        self.receivedSignal = True
+
+
 class CommandExecutor:
     """Sets up a command to be run and executed.
 
@@ -215,8 +245,12 @@ class CommandExecutor:
 
     DEBUG_MSG = '\n[SCRIPT-DEBUG]: Running command: "{}"\n'
 
+    FAILED_COUNT_MSG = '\n[SCRIPT]: Terminated early due to reaching the ' \
+                       '--failed-count.\n'
 
     def __init__(self, co: CommandOptions,
+                 dtHandler: DateTimeHandler = DateTimeHandler(),
+                 signalHandler: SignalHandler = SignalHandler(),
                  rootLogFolder: str = 'runnerLogs',
                  pollInterval: int = 1):
         """
@@ -233,6 +267,8 @@ class CommandExecutor:
         self.activeOptions = parsedCommand[0]
         self.activeOptionsWithVariables = parsedCommand[1]
         self.wrappedCommand = parsedCommand[2]
+        self.__dth = dtHandler
+        self.__signalHandler = signalHandler
         self.__pollInterval = pollInterval
 
         # Defaults
@@ -247,6 +283,65 @@ class CommandExecutor:
         self.rootLogFolder = rootLogFolder
 
         self.__setOptions()
+
+    def runCommand(self):
+        """
+        The main method to be run to begin the process.
+
+            Returns:
+                code (int): The return code that occurred the most
+        """
+        if self.__debugMode:
+            print('\n[SCRIPT]: Debug Mode Activated\n')
+
+        if self.__setupLogging:
+            rootPath = self.__createRootDirectories()
+
+        returnCodes = {}
+        currentRunCount = 0
+        failures = 0
+
+        while (currentRunCount < self.__totalRunCount
+                and not self.__signalHandler.receivedSignal):
+
+            subPath = None
+            if self.__setupLogging:
+                subPath = os.path.join(rootPath, str(currentRunCount + 1))
+                self.__createDirectory(subPath)
+
+            print('\n[SCRIPT]: -----Run Count:',
+                  currentRunCount + 1, '-----\n')
+
+            currentCode = self.__runCommandOnce(subPath)
+
+            if self.__signalHandler.receivedSignal:
+                print('\n[SCRIPT]: Terminated early due to signal: ',
+                      self.__signalHandler.signal, '\n')
+                break
+
+            if currentCode != 0:
+                failures += 1
+            else:
+                # Delete logs for this run since nothing failed
+                if self.__setupLogging:
+                    shutil.rmtree(subPath)
+
+            if currentCode not in returnCodes:
+                returnCodes[currentCode] = 1
+            else:
+                returnCodes[currentCode] += 1
+
+            if (self.__failedCount is not None
+                    and failures >= self.__failedCount):
+                print(self.FAILED_COUNT_MSG)
+                break
+
+            currentRunCount += 1
+
+        if failures == 0 and self.__setupLogging:
+            shutil.rmtree(rootPath)
+
+        return self.__handleReturnCodeOccurrences(returnCodes)
 
     def __setOptions(self):
         """Sets all the flags based on the provided options"""
@@ -278,14 +373,7 @@ class CommandExecutor:
             self.__setupLogging = True
 
     def __gatherSystemStats(self, pid: int, f: IO):
-        """Logs system stats of the given pid to the given file
-        
-            Parameters:
-                pid (int):
-
-                f (IO): an opened, writable IO
-        """
-
+        """Logs system stats of the given pid to the given file"""
         p = psutil.Process(pid)
         memory = p.memory_percent()
         cpuPercent = p.cpu_percent()
@@ -329,7 +417,7 @@ class CommandExecutor:
             Returns:
                 (int) The exit code
         """
-
+        
         command = []
 
         if self.__sysTrace:
@@ -376,6 +464,59 @@ class CommandExecutor:
 
         return exitCode
 
+    def __handleReturnCodeOccurrences(self,
+                                      returnCodes: Dict[int, int]) -> int:
+        """
+        Prints the return codes and returns the most frequent code
+
+        Parameters:
+            returnCodes (Dict[int, int]):
+                The format of the dictionary should be:
+                    key=Return Code
+                    value=Total Occurrences
+
+        The printed format is eg:
+
+            [SCRIPT]: Summary
+
+            Exit Code   Occurrences
+            -----------------------
+            0           1
+            2           3
+
+        """
+        highestOccurrenceCount = -1
+        highestOccurrenceCode = 0
+        print('\n\n[SCRIPT]: Summary')
+        print('\n{:<12} {:<11}'.format('Exit Code', 'Occurrences'))
+        print('------------------------')
+        for key in returnCodes:
+            amount = returnCodes[key]
+            if amount >= highestOccurrenceCount:
+                highestOccurrenceCode = key
+                highestOccurrenceCount = amount
+            print('{:<12} {:<11}'.format(key, amount))
+        print('')
+        return highestOccurrenceCode
+
+    def __createRootDirectories(self) -> str:
+        """Creates the root directories for the logs
+
+            Returns:
+                rootPath (str):
+                    The structure is: ./{self.rootLogFolder}/{y-m-d_H:M:S}
+        """
+
+        currentDateAndTime = self.__dth.getNowFormattedString()
+        rootPath = os.path.join(self.rootLogFolder, currentDateAndTime, '')
+        os.makedirs(rootPath, mode=0o777)
+        return rootPath
+
+    def __createDirectory(self, path):
+        """Creates only the leaf folder from the given path"""
+        os.mkdir(path, mode=0o777)
+
+
 
 def main():
     co = CommandOptions(sys.argv)
@@ -383,7 +524,7 @@ def main():
         return None
 
     ce = CommandExecutor(co)
-    return ce.__runCommandOnce()
+    return ce.runCommand()
 
 
 if __name__ == "__main__":
