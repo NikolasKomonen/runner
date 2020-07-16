@@ -13,7 +13,7 @@ from typing import Dict, List, IO
 
 class CommandOptions:
     """Handles console commands for CommandExecutor
-    
+
     Will mainly parse the input and indicate if there were
     any errors.
     """
@@ -201,12 +201,189 @@ class CommandOptions:
             return None
         return number
 
+
+
+class CommandExecutor:
+    """Sets up a command to be run and executed.
+
+    Will run the command and setup all necessary logging.
+    """
+
+    SYS_TRACE_FILENAME = "systemTrace.txt"
+    CALL_TRACE_FILENAME = "callTrace.txt"
+    LOG_TRACE_FILENAME = "logTrace.txt"
+
+    DEBUG_MSG = '\n[SCRIPT-DEBUG]: Running command: "{}"\n'
+
+
+    def __init__(self, co: CommandOptions,
+                 rootLogFolder: str = 'runnerLogs',
+                 pollInterval: int = 1):
+        """
+            Parameters:
+                rootLogFolder (str): The root folder to hold all the logs
+
+                pollInterval (int): The interval to poll the wrapped command
+        """
+        parsedCommand = co.getParsedCommand()
+
+        if parsedCommand is None:
+            return
+
+        self.activeOptions = parsedCommand[0]
+        self.activeOptionsWithVariables = parsedCommand[1]
+        self.wrappedCommand = parsedCommand[2]
+        self.__pollInterval = pollInterval
+
+        # Defaults
+        self.__totalRunCount = 1
+        self.__failedCount = None
+        self.__sysTrace = False
+        self.__callTrace = False
+        self.__logTrace = False
+        self.__debugMode = False
+        self.__help = False
+        self.__setupLogging = False
+        self.rootLogFolder = rootLogFolder
+
+        self.__setOptions()
+
+    def __setOptions(self):
+        """Sets all the flags based on the provided options"""
+
+        if CommandOptions.COUNT in self.activeOptionsWithVariables:
+            self.__totalRunCount = self.activeOptionsWithVariables[
+                CommandOptions.COUNT]
+
+        if CommandOptions.FAILED_COUNT in self.activeOptionsWithVariables:
+            self.__failedCount = self.activeOptionsWithVariables[
+                CommandOptions.FAILED_COUNT]
+
+        if CommandOptions.SYS_TRACE in self.activeOptions:
+            self.__sysTrace = True
+
+        if CommandOptions.CALL_TRACE in self.activeOptions:
+            self.__callTrace = True
+
+        if CommandOptions.LOG_TRACE in self.activeOptions:
+            self.__logTrace = True
+
+        if CommandOptions.DEBUG in self.activeOptions:
+            self.__debugMode = True
+
+        if CommandOptions.HELP in self.activeOptions:
+            self.__help = True
+
+        if self.__sysTrace or self.__callTrace or self.__logTrace:
+            self.__setupLogging = True
+
+    def __gatherSystemStats(self, pid: int, f: IO):
+        """Logs system stats of the given pid to the given file
+        
+            Parameters:
+                pid (int):
+
+                f (IO): an opened, writable IO
+        """
+
+        p = psutil.Process(pid)
+        memory = p.memory_percent()
+        cpuPercent = p.cpu_percent()
+        threads = p.num_threads()
+        network = psutil.net_io_counters()
+        diskIO = p.io_counters()
+
+        f.write(str(diskIO))
+        f.write('\n')
+        f.write(str(round(memory, 3))+"%")
+        f.write('\n')
+        f.write(str(cpuPercent)+"/"+str(threads))
+        f.write('\n')
+        f.write(str(network))
+        f.write('\n-----------\n')
+
+    def __runSubprocessCommand(self, command: str) -> subprocess.Popen:
+        """Runs the given command in a subprocess.
+
+            Parameters:
+                
+                command (str):
+                    The command is the same that you would enter into a terminal.
+
+            Returns: 
+                subprocess.Popen
+        """
+
+        if self.__debugMode:
+            print(self.DEBUG_MSG.format(command))
+        return subprocess.Popen(command, shell=True)
+
+    def __runCommandOnce(self, logPath: str) -> int:
+        """
+        Sets up the logs and runs the wrapped command
+
+            Parameters:
+                logPath (str): The path to output all logs for this run.
+                    The path must already exist in the filesystem.
+
+            Returns:
+                (int) The exit code
+        """
+
+        command = []
+
+        if self.__sysTrace:
+            statsFile = open(os.path.join(
+                logPath, self.SYS_TRACE_FILENAME), 'w')
+            statsFile.write("Disk IO\n")
+            statsFile.write("Memory\n")
+            statsFile.write("Processes/Threads\n")
+            statsFile.write("Network\n")
+            statsFile.write('-----------\n')
+
+        if self.__callTrace:
+            command.extend(
+                ['strace',
+                 '-o',
+                 os.path.join(logPath, self.CALL_TRACE_FILENAME)])
+
+        command.extend(self.wrappedCommand)
+
+        if self.__logTrace:
+            command.extend(
+                ['2>&1',
+                 '|',
+                 'tee',
+                 os.path.join(logPath, self.LOG_TRACE_FILENAME)])
+            command.extend([';(exit ${PIPESTATUS})'])
+
+        p = self.__runSubprocessCommand(' '.join(command))
+
+        while not self.__signalHandler.receivedSignal:
+            exitCode = p.poll()
+
+            if exitCode is not None:
+                p.kill()
+                break
+
+            if self.__sysTrace:
+                self.__gatherSystemStats(p.pid, statsFile)
+
+            time.sleep(self.__pollInterval)
+
+        if self.__sysTrace:
+            statsFile.close()
+
+        return exitCode
+
+
 def main():
     co = CommandOptions(sys.argv)
     if not co.parseSuccessful:
         return None
-    
-    print(co.getParsedCommand())
+
+    ce = CommandExecutor(co)
+    return ce.__runCommandOnce()
 
 
 if __name__ == "__main__":
